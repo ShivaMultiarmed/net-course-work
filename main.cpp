@@ -133,7 +133,7 @@ string parsePayload(const char* responseBuffer, u_int& offset, const u_int lengt
     }
     pos += 2;
     in_addr addr;
-    memcpy(&addr, responseBuffer + offset, 4);
+    memcpy(&addr, responseBuffer + pos, 4);
     offset = pos + 4;
     return inet_ntoa(addr);
 }
