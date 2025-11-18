@@ -127,14 +127,9 @@ string parseName(const char* buffer, u_int& offset, const char* packet_start = n
 }
 
 string parsePayload(const char* responseBuffer, u_int& offset, const u_int length) {
-    u_int pos = offset;
-    while(ntohs(*(responseBuffer + pos)) == 0x0010) {
-        pos += pos == offset ? 16 : 12;
-    }
-    pos += 2;
     in_addr addr;
-    memcpy(&addr, responseBuffer + pos, 4);
-    offset = pos + 4;
+    memcpy(&addr, responseBuffer + offset, 4);
+    offset += 4;
     return inet_ntoa(addr);
 }
 
@@ -218,7 +213,7 @@ int main (int argc, char** argv) {
     offset += sizeof(u_short);
     response.answer.rData = parsePayload(responseBuffer, offset, response.answer.rdLength);
     response = response.ntoh();
-    offset += response.answer.rdLength;
+    cout << response.answer.rData << endl;
     close(client);
     return 0;
 }
