@@ -11,11 +11,15 @@
 
 using namespace std;
 
-#pragma pack(push, 1)
 struct DnsHeader {
     u_short id, flags, qdCount, anCount, nsCount, arCount;
+    DnsHeader hton() {
+        return {htons(id), htons(flags), htons(qdCount), htons(anCount), htons(nsCount), htons(arCount)};
+    }
+    DnsHeader ntoh() {
+        return {ntohs(id), ntohs(flags), ntohs(qdCount), ntohs(anCount), ntohs(nsCount), ntohs(arCount)};
+    }
 };
-#pragma pack(pop)
 
 enum QType: u_short {
     A = 1,
@@ -23,18 +27,22 @@ enum QType: u_short {
     PTR = 12,
     SOA = 6,
     CNAME = 5
-};
+}; 
 
-static map<string, QType> qtypes = {
+static const map<string, QType> qtypes = {
     {"a", A}, {"aaaa", AAAA}, {"ptr", PTR}, {"soa", SOA}, {"cname", CNAME}
 };
 
-#pragma pack(push, 1)
 struct QuerySection {
     string qName;
     u_short qType, qClass;
+    QuerySection hton() {
+        return {qName, htons(qType), htons(qClass)};
+    }
+    QuerySection ntoh() {
+        return {qName, ntohs(qType), ntohs(qClass)};
+    }
 };
-#pragma pack(pop)
 
 enum OpCode: u_char {
     standard = 0,
@@ -45,7 +53,7 @@ enum OpCode: u_char {
 string encodeName(string name) {
     vector<string> subStrings;
     while(!name.empty()) {
-        int pos = name.find(".", 0), size = pos >= 0 ? pos : name.length();
+        int pos = name.find("."), size = pos >= 0 ? pos : name.length();
         subStrings.push_back(name.substr(0, size));
         name = pos >= 0 ? name.substr(size + 1) : "";
     }
@@ -57,91 +65,77 @@ string encodeName(string name) {
     return name;
 }
 
-#pragma pack(push, 1)
 struct DnsRequest {
     DnsHeader header;
     QuerySection query;
-    DnsRequest(u_short id, OpCode opcode, string host, QType qType) {
-        header = {htons(id), htons((short)(0 << 15 | opcode << 14 | 1 << 8)), htons(1)};
-        string encodedHost = encodeName(host);
-        query = {encodedHost, htons(qType), htons(1)};
+    DnsRequest(const u_short id, const OpCode opcode, const string host, const QType qType) {
+        header = {id, (u_short)(opcode << 14 | 1 << 8), 1};
+        const string encodedHost = encodeName(host);
+        query = {encodedHost, qType, 1};
+    }
+    DnsRequest(const DnsHeader header, const QuerySection query): header(header), query(query) { }
+    DnsRequest hton() {
+        return DnsRequest(header.hton(), query.hton());
     }
 };
-#pragma pack(pop)
 
-#pragma pack(push, 1)
 struct AnswerSection {
     string name;
     u_short type, klass;
     u_int ttl;
     u_short rdLength;
     string rData;
+    AnswerSection ntoh() {
+        return {name, ntohs(type), ntohs(klass), ntohl(ttl), ntohs(rdLength), rData};
+    }
 };
-#pragma pack(pop)
 
-#pragma pack(push, 1)
 struct DnsResponse {
     DnsHeader header;
     QuerySection query;
     AnswerSection answer;
-};
-#pragma pack(pop)
-
-string getPrettyPayload(const string payload) {
-    string payloadString;
-    for (char ch : payload) {
-        payloadString += ch;
-        if (ch == '\0') break;
+    DnsResponse ntoh() {
+        return {header.ntoh(), query.ntoh(), answer.ntoh()};
     }
-    return payloadString;
-}
+};
 
-string parseName(const char* buffer, u_int& offs) {
+string parseName(const char* buffer, u_int& offset, const char* packet_start = nullptr) {
     string name;
-    u_int offset = offs, originalOffset = offset;
-    bool jumped = false; // флаг, что был jump через pointer
-    const u_int MAX_JUMPS = 10; // защита от бесконечного цикла
-    u_int jumps = 0;
-
+    bool first = true;
     while (true) {
-        if (jumps++ > MAX_JUMPS) break; // защита
-        u_char len = buffer[offset];
+        u_char len = buffer[offset++];
+        if (len == 0) break;
 
-        // конец имени
-        if (len == 0) {
-            if (!jumped) offset++; // сдвигаем только если не было pointer
+        if ((len & 0xC0) == 0xC0) {
+            if (packet_start == nullptr) packet_start = buffer;
+            int ptr = ((len & 0x3F) << 8) | buffer[offset++];
+            int saved_offset = offset;
+            offset = ptr;
+            string part = parseName(buffer, offset, packet_start);
+            if (!first) name += '.';
+            name += part;
+            offset = saved_offset;
             break;
         }
 
-        // pointer compression: первые два бита = 11
-        if ((len & 0xC0) == 0xC0) {
-            u_char next = buffer[offset + 1];
-            u_int pointer = ((len & 0x3F) << 8) | next;
-            if (!jumped) offset += 2; // сдвигаем исходный offset один раз
-            offset = pointer; // меняем offset на позицию pointer
-            jumped = true;
-            continue;
-        }
-
-        // обычная метка
-        offset++;
-        if (!name.empty()) name += '.';
+        if (!first) name += '.';
         name.append(buffer + offset, len);
         offset += len;
+        first = false;
     }
-
-    // если был jump, вернуть исходный offset + 2 (pointer)
-    if (jumped) {
-        return {name, originalOffset + 2};
-    }
-
     return name;
 }
 
-string parsePayload(const char* responseBuffer, u_int offset, u_int length) {
-    string payload;
-    memcpy(payload.data(), responseBuffer + offset, length);
-    return payload;
+string parsePayload(const char* responseBuffer, u_int& offset, const u_int length) {
+    u_int pos = offset;
+    while(ntohs(*(responseBuffer + pos)) == 0x0010) {
+        pos += pos == offset ? 16 : 12;
+    }
+    pos += 2;
+    in_addr addr;
+    memcpy(&addr, responseBuffer + offset, 4);
+    offset = pos + 4;
+    return inet_ntoa(addr);
 }
 
 void printUsage() {
@@ -188,12 +182,13 @@ int main (int argc, char** argv) {
     u_int serverAddressSize = sizeof(sockaddr_in);
 
     DnsRequest request = DnsRequest((u_short)1, (OpCode)0, host, qType);
-    char requestBuffer[sizeof(DnsRequest)];
+    request = request.hton();
+    char requestBuffer[1024];
     string payload = request.query.qName;
     u_int offset = 0;
     memcpy(requestBuffer, &request.header, sizeof(DnsHeader));
     offset += sizeof(request.header);
-    memcpy(requestBuffer + offset, payload.c_str(), payload.size());
+    memcpy(requestBuffer + offset, payload.data(), payload.size());
     offset += payload.size();
     memcpy(requestBuffer + offset, &request.query.qType, sizeof(u_short));
     offset += sizeof(u_short);
@@ -202,19 +197,17 @@ int main (int argc, char** argv) {
     sendto(client, requestBuffer, offset, 0, (sockaddr*)&serverAddress, serverAddressSize);
 
     DnsResponse response;
-    char responseBuffer[sizeof(DnsResponse)];
-    int bytesReceived = recvfrom(client, responseBuffer, sizeof(DnsResponse), 0, (sockaddr*)&serverAddress, &serverAddressSize);
+    char responseBuffer[10 * 1024];
+    int bytesReceived = recvfrom(client, responseBuffer, 1024, 0, (sockaddr*)&serverAddress, &serverAddressSize);
     offset = 0;
     memcpy(&response.header, responseBuffer, sizeof(DnsHeader));
     offset += sizeof(DnsHeader);
-    response.query.qName = parseName(responseBuffer, offset);
-    offset += response.query.qName.size();
+    response.query.qName = parseName(responseBuffer, offset, responseBuffer);
     memcpy(&response.query.qType, responseBuffer + offset, sizeof(u_short));
     offset += sizeof(u_short);
     memcpy(&response.query.qClass, responseBuffer + offset, sizeof(u_short));
     offset += sizeof(u_short);
-    response.answer.name = parseName(responseBuffer, offset);
-    offset += response.answer.name.size();
+    response.answer.name = parseName(responseBuffer, offset, responseBuffer);
     memcpy(&response.answer.type, responseBuffer + offset, sizeof(u_short));
     offset += sizeof(u_short);
     memcpy(&response.answer.klass, responseBuffer + offset, sizeof(u_short));
@@ -224,10 +217,8 @@ int main (int argc, char** argv) {
     memcpy(&response.answer.rdLength, responseBuffer + offset, sizeof(u_short));
     offset += sizeof(u_short);
     response.answer.rData = parsePayload(responseBuffer, offset, response.answer.rdLength);
-    cout << response.answer.rData << endl;
-    for (u_int i = 0; i < 1024; i++) {
-        printf("%02x", responseBuffer[i]);
-    }
+    response = response.ntoh();
+    offset += response.answer.rdLength;
     close(client);
     return 0;
 }
