@@ -8,6 +8,9 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <vector>
+#include <algorithm>
+#include <sstream>
+#include <iomanip>
 
 using namespace std;
 
@@ -25,29 +28,11 @@ enum QType: u_short {
     A = 1,
     AAAA = 28,
     PTR = 12,
-    SOA = 6,
     CNAME = 5
 }; 
 
 static const map<string, QType> qtypes = {
-    {"a", A}, {"aaaa", AAAA}, {"ptr", PTR}, {"soa", SOA}, {"cname", CNAME}
-};
-
-struct QuerySection {
-    string qName;
-    u_short qType, qClass;
-    QuerySection hton() {
-        return {qName, htons(qType), htons(qClass)};
-    }
-    QuerySection ntoh() {
-        return {qName, ntohs(qType), ntohs(qClass)};
-    }
-};
-
-enum OpCode: u_char {
-    standard = 0,
-    inverse = 1,
-    server_status = 2
+    {"a", A}, {"aaaa", AAAA}, {"ptr", PTR}, {"cname", CNAME}
 };
 
 string encodeName(string name) {
@@ -65,13 +50,29 @@ string encodeName(string name) {
     return name;
 }
 
+struct QuerySection {
+    string qName;
+    u_short qType, qClass;
+    QuerySection hton() {
+        return {encodeName(qName), htons(qType), htons(qClass)};
+    }
+    QuerySection ntoh() {
+        return {qName, ntohs(qType), ntohs(qClass)};
+    }
+};
+
+enum OpCode: u_char {
+    standard = 0,
+    inverse = 1,
+    server_status = 2
+};
+
 struct DnsRequest {
     DnsHeader header;
     QuerySection query;
     DnsRequest(const u_short id, const OpCode opcode, const string host, const QType qType) {
         header = {id, (u_short)(opcode << 14 | 1 << 8), 1};
-        const string encodedHost = encodeName(host);
-        query = {encodedHost, qType, 1};
+        query = {host, qType, 1};
     }
     DnsRequest(const DnsHeader header, const QuerySection query): header(header), query(query) { }
     DnsRequest hton() {
@@ -126,11 +127,87 @@ string parseName(const char* buffer, u_int& offset, const char* packet_start = n
     return name;
 }
 
-string parsePayload(const char* responseBuffer, u_int& offset, const u_int length) {
-    in_addr addr;
-    memcpy(&addr, responseBuffer + offset, 4);
-    offset += 4;
-    return inet_ntoa(addr);
+string parsePayload(const char* responseBuffer, QType qType, u_int& offset, const u_int length) {
+    switch(qType) {
+        case A: {
+            in_addr addr;
+            memcpy(&addr, responseBuffer + offset, 4);
+            offset += 4;
+            char addrChar[INET_ADDRSTRLEN];
+            const char* address = inet_ntop(AF_INET, &addr.s_addr, addrChar, INET_ADDRSTRLEN);
+            return string(address);
+        }
+        case AAAA: {
+            in6_addr addr;
+            memcpy(&addr, responseBuffer + offset, 16);
+            offset += 16;
+            char addrChar[INET6_ADDRSTRLEN];
+            const char* address = inet_ntop(AF_INET6, &addr, addrChar, INET6_ADDRSTRLEN);
+            return string(address);
+            break;
+        }
+        case PTR:
+        case CNAME:
+            return parseName(responseBuffer, offset);
+        default:
+            return "";
+    }
+}
+
+string getInAddrArpa(string ip) {
+    vector<string> ipSegments(4);
+    for (u_int i = 0; i < 4; i++) {
+        u_int dotPos = ip.find(".");
+        ipSegments.at(i) = ip.substr(0, dotPos < string::npos ? dotPos : ip.size());
+        ip = ip.replace(0, dotPos < string::npos ? dotPos + 1 : ip.size(), "");
+    }
+    reverse(ipSegments.begin(), ipSegments.end());
+    string result;
+    for (const string &segment : ipSegments) {
+        result += segment + ".";
+    }
+    result += "in-addr.arpa";
+    return result;
+}
+
+string getInAddr6Arpa(string ip){
+    u_int groupCount = 1;
+    for (char ch : ip) {
+        if (ch == ':') {
+            groupCount++;
+        }
+    }
+    u_int compressionPos = ip.find("::");
+    if (compressionPos < ip.size()) {
+        u_int colonsToAdd = 8 - groupCount;
+        for (u_int i = 0; i < colonsToAdd; i++) {
+            ip.insert(compressionPos + 1, ":");
+        }
+    }
+    u_int start = 0, end = 0;
+    ip += ":";
+    while(end < 8 * 4 + 8) {
+        if (ip.at(end) == ':') {
+            while (end - start < 4) {
+                ip.insert(start, "0");
+                end++;
+            }
+            end++;
+            start = end;
+        } else {
+            end++;
+        }
+    }
+    u_int colonPos = ip.find(":");
+    while(colonPos < ip.size()) {
+        ip = ip.replace(colonPos, 1, "");
+        colonPos = ip.find(":");
+    }
+    reverse(ip.begin(), ip.end());
+    for (u_int i = 0; i < 32; i++) {
+        ip.insert(2 * i + 1, ".");
+    }
+    return ip + "ip6.arpa";
 }
 
 void printUsage() {
@@ -177,8 +254,17 @@ int main (int argc, char** argv) {
     u_int serverAddressSize = sizeof(sockaddr_in);
 
     DnsRequest request = DnsRequest((u_short)1, (OpCode)0, host, qType);
-    request = request.hton();
+    
     char requestBuffer[1024];
+    if (qType == PTR) {
+        if (request.query.qName.find(".") < string::npos) {
+            request.query.qName = getInAddrArpa(request.query.qName);
+        }
+        else {
+            request.query.qName = getInAddr6Arpa(request.query.qName);
+        }
+    }
+    request = request.hton();
     string payload = request.query.qName;
     u_int offset = 0;
     memcpy(requestBuffer, &request.header, sizeof(DnsHeader));
@@ -197,12 +283,12 @@ int main (int argc, char** argv) {
     offset = 0;
     memcpy(&response.header, responseBuffer, sizeof(DnsHeader));
     offset += sizeof(DnsHeader);
-    response.query.qName = parseName(responseBuffer, offset, responseBuffer);
+    response.query.qName = parseName(responseBuffer, offset);
     memcpy(&response.query.qType, responseBuffer + offset, sizeof(u_short));
     offset += sizeof(u_short);
     memcpy(&response.query.qClass, responseBuffer + offset, sizeof(u_short));
     offset += sizeof(u_short);
-    response.answer.name = parseName(responseBuffer, offset, responseBuffer);
+    response.answer.name = parseName(responseBuffer, offset);
     memcpy(&response.answer.type, responseBuffer + offset, sizeof(u_short));
     offset += sizeof(u_short);
     memcpy(&response.answer.klass, responseBuffer + offset, sizeof(u_short));
@@ -211,8 +297,9 @@ int main (int argc, char** argv) {
     offset += sizeof(u_int);
     memcpy(&response.answer.rdLength, responseBuffer + offset, sizeof(u_short));
     offset += sizeof(u_short);
-    response.answer.rData = parsePayload(responseBuffer, offset, response.answer.rdLength);
     response = response.ntoh();
+    response.answer.rData = parsePayload(responseBuffer, (QType) response.query.qType, offset, response.answer.rdLength);
+    offset += response.answer.rData.size();
     cout << response.answer.rData << endl;
     close(client);
     return 0;
