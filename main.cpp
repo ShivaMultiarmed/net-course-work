@@ -100,6 +100,19 @@ struct DnsResponse {
     }
 };
 
+auto parseFlags(const u_short flags) {
+    return tuple(
+       flags >> 15,
+       (flags >> 11) & 0x0F,
+       (flags >> 10) & 0x1,
+       (flags >> 9) & 0x1,
+       (flags >> 8) & 0x1,
+       (flags >> 7) & 0x1,
+       (flags >> 4) & 0x07,
+       flags & 0x0F
+    );
+}
+
 string parseName(const char* buffer, u_int& offset, const char* packet_start = nullptr) {
     string name;
     bool first = true;
@@ -150,7 +163,7 @@ string parsePayload(const char* responseBuffer, QType qType, u_int& offset, cons
         case CNAME:
             return parseName(responseBuffer, offset);
         default:
-            return "";
+            return "Неизвестный тип записи";
     }
 }
 
@@ -210,9 +223,65 @@ string getInAddr6Arpa(string ip){
     return ip + "ip6.arpa";
 }
 
-void printUsage() {
-    cout << "Incorrect usage" << endl;
-    // TODO
+void print(const DnsHeader& header) {
+    cout << "ID: " << header.id << endl;
+    auto [qr, opcode, aa, tc, rd, ra, z, rcode] = parseFlags(header.flags);
+    cout << "QR: " << qr<< endl;
+    cout << "OPCODE: " << opcode << endl;
+    cout << "AA: " << aa << endl;
+    cout << "TC: " << tc << endl;
+    cout << "RD: " << rd << endl;
+    cout << "RA: " << ra << endl;
+    cout << "Z: " << z << endl;
+    cout << "RCODE: " << rcode << endl;
+    cout << "QDCOUNT: " << header.qdCount << endl;
+    cout << "ANCOUNT: " << header.anCount << endl;
+    cout << "NSCOUNT: " << header.nsCount << endl;
+    cout << "ARCOUNT: " << header.arCount << endl;
+}
+
+void delimeter() {
+    cout << "----------------------------------" << endl;
+}
+
+void print(const QuerySection& query) {
+    cout << "QNAME: " << query.qName << endl;
+    cout << "QTYPE: " << query.qType << endl;
+    cout << "QCLASS: " << query.qClass << endl;
+}
+
+void print(const AnswerSection& answer) {
+    cout << "NAME: " << answer.name << endl;
+    cout << "TYPE: " << answer.type << endl;
+    cout << "TTL: " << answer.ttl << endl;
+    cout << "RDLENGTH: " << answer.rdLength << endl;
+}
+
+void print(const DnsRequest& request) {
+    cout << "Запрос:" << endl;
+    delimeter();
+    print(request.header);
+    print(request.query);
+    delimeter();
+}
+
+void print(const DnsResponse& response) {
+    cout << "Ответ:" << endl;
+    delimeter();
+    print(response.header);
+    print(response.query);
+    print(response.answer);
+    delimeter();
+}
+
+void printUsage(const char* program) {
+    cout << "Использование: " << program << endl;
+    cout << " -h, --host\t" << "имя для поиска" << endl;
+    cout << "[-q, --qtype\t" << "тип записи]" << endl;
+    cout << "[-v, --verbose\t" << "подробный вывод]" << endl;
+    cout << "[-p, --port\t" << "порт DNS-сервера]" << endl;
+    cout << "[-s, --server\t" << "ip-адрес DNS-сервера]" << endl;
+    cout << "[-t, --timeout\t" << "время таймаута, мс.]" << endl;
 }
 
 int main (int argc, char** argv) {
@@ -236,16 +305,16 @@ int main (int argc, char** argv) {
             } else if (arg == "--server" || arg == "-s") {
                 serverHost = string(argv[++i]);
             } else {
-                printUsage();
+                printUsage(argv[0]);
                 return -1;
             }
         }
         if (host.empty()) {
-            printUsage();
+            printUsage(argv[0]);
             return -1;
         }
     } catch (exception e) {
-        printUsage();
+        printUsage(argv[0]);
         return -1;
     }
     int client = socket(AF_INET, SOCK_DGRAM,0);
@@ -263,6 +332,9 @@ int main (int argc, char** argv) {
         else {
             request.query.qName = getInAddr6Arpa(request.query.qName);
         }
+    }
+    if (verbose) {
+        print(request);
     }
     request = request.hton();
     string payload = request.query.qName;
@@ -300,7 +372,11 @@ int main (int argc, char** argv) {
     response = response.ntoh();
     response.answer.rData = parsePayload(responseBuffer, (QType) response.query.qType, offset, response.answer.rdLength);
     offset += response.answer.rData.size();
-    cout << response.answer.rData << endl;
+    if (verbose) {
+        print(response);
+    } else {
+        cout << response.answer.rData << endl;
+    }
     close(client);
     return 0;
 }
