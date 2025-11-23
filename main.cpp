@@ -28,13 +28,14 @@ struct DnsHeader {
 
 enum QType: u_short {
     A = 1,
-    AAAA = 28,
+    NS = 2,
+    CNAME = 5,
     PTR = 12,
-    CNAME = 5
+    AAAA = 28
 }; 
 
 static const map<string, QType> qtypes = {
-    {"a", A}, {"aaaa", AAAA}, {"ptr", PTR}, {"cname", CNAME}
+    {"a", A}, {"aaaa", AAAA}, {"ptr", PTR}, {"cname", CNAME}, {"ns", NS}
 };
 
 string encodeName(string name) {
@@ -97,7 +98,7 @@ struct AnswerSection {
 struct DnsResponse {
     DnsHeader header;
     vector<QuerySection> queries;
-    vector<AnswerSection> answers;
+    vector<AnswerSection> answers, authorities, additionals;
     DnsResponse ntoh() {
         transform(queries.begin(), queries.end(), queries.begin(), [](QuerySection& query){return query.ntoh();});
         transform(answers.begin(), answers.end(), answers.begin(), [](AnswerSection& answer){return answer.ntoh();});
@@ -170,6 +171,7 @@ string parsePayload(
         }
         case PTR:
         case CNAME:
+        case NS:
             return parseName(responseBuffer, offset);
         default:
             offset += rdLength;
@@ -265,12 +267,15 @@ void print(const AnswerSection& answer) {
     cout << "TYPE: " << answer.type << endl;
     cout << "TTL: " << answer.ttl << endl;
     cout << "RDLENGTH: " << answer.rdLength << endl;
+    cout << "RDATA: " << answer.rData << endl;
 }
 
 void print(const DnsRequest& request) {
     cout << "Запрос:" << endl;
     delimeter();
     print(request.header);
+    delimeter();
+    cout << "Секция запросов:" << endl;
     delimeter();
     for (const QuerySection& query : request.queries) {
         print(query);
@@ -283,13 +288,37 @@ void print(const DnsResponse& response) {
     delimeter();
     print(response.header);
     delimeter();
+    cout << "Секция запросов:" << endl;
+    delimeter();
     for (const QuerySection& query : response.queries) {
         print(query);
         delimeter();
     }
-    for (const AnswerSection& answer : response.answers) {
-        print(answer);
+    if (!response.answers.empty()) {
+        cout << "Секция ответов" << endl;
         delimeter();
+        for (const AnswerSection& answer : response.answers) {
+            print(answer);
+            delimeter();
+        }
+    } else {
+        cout << "Ничего не найдено" << endl;
+    }
+    if (!response.authorities.empty()) {
+        cout << "NS секция" << endl;
+        delimeter();
+        for (const AnswerSection& authority : response.authorities) {
+            print(authority);
+            delimeter();
+        }
+    }
+    if (!response.additionals.empty()) {
+        cout << "Дополнительно" << endl;
+        delimeter();
+        for (const AnswerSection& additional : response.additionals) {
+            print(additional);
+            delimeter();
+        }
     }
 }
 
@@ -301,6 +330,23 @@ void printUsage(const char* program) {
     cout << "[-p, --port\t" << "порт DNS-сервера]" << endl;
     cout << "[-s, --server\t" << "ip-адрес DNS-сервера]" << endl;
     cout << "[-t, --timeout\t" << "время таймаута, мс.]" << endl;
+}
+
+void parseAnswer(
+    AnswerSection& answer, 
+    const char* responseBuffer, 
+    u_int& offset
+) {
+    answer.name = parseName(responseBuffer, offset);
+    memcpy(&answer.type, responseBuffer + offset, sizeof(u_short));
+    offset += sizeof(u_short);
+    memcpy(&answer.klass, responseBuffer + offset, sizeof(u_short));
+    offset += sizeof(u_short);
+    memcpy(&answer.ttl, responseBuffer + offset, sizeof(u_int));
+    offset += sizeof(u_int);
+    memcpy(&answer.rdLength, responseBuffer + offset, sizeof(u_short));
+    offset += sizeof(u_short);
+    answer.rData = parsePayload(responseBuffer, (QType) ntohs(answer.type), offset, ntohs(answer.rdLength));
 }
 
 DnsResponse requestName(
@@ -352,16 +398,19 @@ DnsResponse requestName(
     response.answers = vector<AnswerSection>(ntohs(response.header.anCount));
 
     for (AnswerSection& answer : response.answers) {
-        answer.name = parseName(responseBuffer, offset);
-        memcpy(&answer.type, responseBuffer + offset, sizeof(u_short));
-        offset += sizeof(u_short);
-        memcpy(&answer.klass, responseBuffer + offset, sizeof(u_short));
-        offset += sizeof(u_short);
-        memcpy(&answer.ttl, responseBuffer + offset, sizeof(u_int));
-        offset += sizeof(u_int);
-        memcpy(&answer.rdLength, responseBuffer + offset, sizeof(u_short));
-        offset += sizeof(u_short);
-        answer.rData = parsePayload(responseBuffer, (QType) ntohs(answer.type), offset, ntohs(answer.rdLength));
+        parseAnswer(answer, responseBuffer, offset);
+    }
+
+    response.authorities = vector<AnswerSection>(ntohs(response.header.nsCount));
+
+    for (AnswerSection& authority : response.authorities) {
+        parseAnswer(authority, responseBuffer, offset);
+    }
+
+    response.additionals = vector<AnswerSection>(ntohs(response.header.arCount));
+
+    for (AnswerSection& additional : response.additionals) {
+        parseAnswer(additional, responseBuffer, offset);
     }
     
     response = response.ntoh();
@@ -372,7 +421,7 @@ DnsResponse requestName(
 int main (int argc, char** argv) {
     QType qType = A;
     u_int timeout = 1000, port = 53;
-    bool verbose;
+    bool verbose = false;
     string host, serverHost = "8.8.8.8";
     try {
         for (u_int i = 1; i < argc; i++) {
@@ -429,8 +478,15 @@ int main (int argc, char** argv) {
     if (verbose) {
         print(response);
     } else {
-        for (const AnswerSection& answer : response.answers) {
-            cout << answer.rData << endl;
+        if (!response.answers.empty()) {
+            cout << "Секции ответов" << endl;
+            delimeter();
+            for (const AnswerSection& answer : response.answers) {
+                cout << answer.rData << endl;
+                delimeter();
+            }
+        } else {
+            cout << "Ничего не найдено" << endl;
         }
     }
 
