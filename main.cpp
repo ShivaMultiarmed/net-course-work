@@ -14,6 +14,8 @@
 
 using namespace std;
 
+static const u_int BUFFER_SIZE = 1024;
+
 struct DnsHeader {
     u_short id, flags, qdCount, anCount, nsCount, arCount;
     DnsHeader hton() {
@@ -69,14 +71,15 @@ enum OpCode: u_char {
 
 struct DnsRequest {
     DnsHeader header;
-    QuerySection query;
+    vector<QuerySection> queries;
     DnsRequest(const u_short id, const OpCode opcode, const string host, const QType qType) {
         header = {id, (u_short)(opcode << 14 | 1 << 8), 1};
-        query = {host, qType, 1};
+        queries = {{host, qType, 1}};
     }
-    DnsRequest(const DnsHeader header, const QuerySection query): header(header), query(query) { }
+    DnsRequest(const DnsHeader header, const vector<QuerySection> queries): header(header), queries(queries) { }
     DnsRequest hton() {
-        return DnsRequest(header.hton(), query.hton());
+        transform(queries.begin(), queries.end(), queries.begin(), [](QuerySection& query){return query.hton();});
+        return DnsRequest(header.hton(), queries);
     }
 };
 
@@ -93,10 +96,12 @@ struct AnswerSection {
 
 struct DnsResponse {
     DnsHeader header;
-    QuerySection query;
-    AnswerSection answer;
+    vector<QuerySection> queries;
+    vector<AnswerSection> answers;
     DnsResponse ntoh() {
-        return {header.ntoh(), query.ntoh(), answer.ntoh()};
+        transform(queries.begin(), queries.end(), queries.begin(), [](QuerySection& query){return query.ntoh();});
+        transform(answers.begin(), answers.end(), answers.begin(), [](AnswerSection& answer){return answer.ntoh();});
+        return {header.ntoh(), queries, answers};
     }
 };
 
@@ -113,19 +118,19 @@ auto parseFlags(const u_short flags) {
     );
 }
 
-string parseName(const char* buffer, u_int& offset, const char* packet_start = nullptr) {
+string parseName(const char* responseBuffer, u_int& offset, const char* packet_start = nullptr) {
     string name;
     bool first = true;
     while (true) {
-        u_char len = buffer[offset++];
+        u_char len = responseBuffer[offset++];
         if (len == 0) break;
 
         if ((len & 0xC0) == 0xC0) {
-            if (packet_start == nullptr) packet_start = buffer;
-            int ptr = ((len & 0x3F) << 8) | buffer[offset++];
+            if (packet_start == nullptr) packet_start = responseBuffer;
+            int ptr = ((len & 0x3F) << 8) | responseBuffer[offset++];
             int saved_offset = offset;
             offset = ptr;
-            string part = parseName(buffer, offset, packet_start);
+            string part = parseName(responseBuffer, offset, packet_start);
             if (!first) name += '.';
             name += part;
             offset = saved_offset;
@@ -133,36 +138,41 @@ string parseName(const char* buffer, u_int& offset, const char* packet_start = n
         }
 
         if (!first) name += '.';
-        name.append(buffer + offset, len);
+        name.append(responseBuffer + offset, len);
         offset += len;
         first = false;
     }
     return name;
 }
 
-string parsePayload(const char* responseBuffer, QType qType, u_int& offset, const u_int length) {
+string parsePayload(
+    const char* responseBuffer,
+    const QType qType,
+    u_int& offset,
+    const u_int rdLength
+) {
     switch(qType) {
         case A: {
             in_addr addr;
-            memcpy(&addr, responseBuffer + offset, 4);
-            offset += 4;
+            memcpy(&addr, responseBuffer + offset, rdLength);
+            offset += rdLength;
             char addrChar[INET_ADDRSTRLEN];
             const char* address = inet_ntop(AF_INET, &addr.s_addr, addrChar, INET_ADDRSTRLEN);
             return string(address);
         }
         case AAAA: {
             in6_addr addr;
-            memcpy(&addr, responseBuffer + offset, 16);
-            offset += 16;
+            memcpy(&addr, responseBuffer + offset, rdLength);
+            offset += rdLength;
             char addrChar[INET6_ADDRSTRLEN];
             const char* address = inet_ntop(AF_INET6, &addr, addrChar, INET6_ADDRSTRLEN);
             return string(address);
-            break;
         }
         case PTR:
         case CNAME:
             return parseName(responseBuffer, offset);
         default:
+            offset += rdLength;
             return "Неизвестный тип записи";
     }
 }
@@ -261,17 +271,26 @@ void print(const DnsRequest& request) {
     cout << "Запрос:" << endl;
     delimeter();
     print(request.header);
-    print(request.query);
     delimeter();
+    for (const QuerySection& query : request.queries) {
+        print(query);
+        delimeter();
+    }
 }
 
 void print(const DnsResponse& response) {
     cout << "Ответ:" << endl;
     delimeter();
     print(response.header);
-    print(response.query);
-    print(response.answer);
     delimeter();
+    for (const QuerySection& query : response.queries) {
+        print(query);
+        delimeter();
+    }
+    for (const AnswerSection& answer : response.answers) {
+        print(answer);
+        delimeter();
+    }
 }
 
 void printUsage(const char* program) {
@@ -282,6 +301,72 @@ void printUsage(const char* program) {
     cout << "[-p, --port\t" << "порт DNS-сервера]" << endl;
     cout << "[-s, --server\t" << "ip-адрес DNS-сервера]" << endl;
     cout << "[-t, --timeout\t" << "время таймаута, мс.]" << endl;
+}
+
+DnsResponse requestName(
+    DnsRequest& request,
+    const int client,
+    const sockaddr_in* serverAddress
+) {
+    request = request.hton();
+
+    char requestBuffer[BUFFER_SIZE];
+
+    u_int offset = 0;
+    memcpy(requestBuffer, &request.header, sizeof(DnsHeader));
+    offset += sizeof(request.header);
+
+    for (const QuerySection& query : request.queries) {
+        string payload = query.qName;
+        memcpy(requestBuffer + offset, payload.data(), payload.size());
+        offset += payload.size();
+        memcpy(requestBuffer + offset, &query.qType, sizeof(u_short));
+        offset += sizeof(u_short);
+        memcpy(requestBuffer + offset, &query.qClass, sizeof(u_short));
+        offset += sizeof(u_short);
+    }
+
+    u_int serverAddressSize = sizeof(sockaddr_in);
+
+    sendto(client, requestBuffer, offset, 0, (sockaddr*)serverAddress, serverAddressSize);
+
+    DnsResponse response;
+    char responseBuffer[BUFFER_SIZE];
+
+    int bytesReceived = recvfrom(client, responseBuffer, BUFFER_SIZE, 0, (sockaddr*)serverAddress, &serverAddressSize);
+    offset = 0;
+
+    memcpy(&response.header, responseBuffer, sizeof(DnsHeader));
+    offset += sizeof(DnsHeader);
+
+    response.queries = vector<QuerySection>(ntohs(response.header.qdCount));
+
+    for (QuerySection& query : response.queries) {
+        query.qName = parseName(responseBuffer, offset);
+        memcpy(&query.qType, responseBuffer + offset, sizeof(u_short));
+        offset += sizeof(u_short);
+        memcpy(&query.qClass, responseBuffer + offset, sizeof(u_short));
+        offset += sizeof(u_short);
+    }
+
+    response.answers = vector<AnswerSection>(ntohs(response.header.anCount));
+
+    for (AnswerSection& answer : response.answers) {
+        answer.name = parseName(responseBuffer, offset);
+        memcpy(&answer.type, responseBuffer + offset, sizeof(u_short));
+        offset += sizeof(u_short);
+        memcpy(&answer.klass, responseBuffer + offset, sizeof(u_short));
+        offset += sizeof(u_short);
+        memcpy(&answer.ttl, responseBuffer + offset, sizeof(u_int));
+        offset += sizeof(u_int);
+        memcpy(&answer.rdLength, responseBuffer + offset, sizeof(u_short));
+        offset += sizeof(u_short);
+        answer.rData = parsePayload(responseBuffer, (QType) ntohs(answer.type), offset, ntohs(answer.rdLength));
+    }
+    
+    response = response.ntoh();
+
+    return response;
 }
 
 int main (int argc, char** argv) {
@@ -324,59 +409,31 @@ int main (int argc, char** argv) {
 
     DnsRequest request = DnsRequest((u_short)1, (OpCode)0, host, qType);
     
-    char requestBuffer[1024];
-    if (qType == PTR) {
-        if (request.query.qName.find(".") < string::npos) {
-            request.query.qName = getInAddrArpa(request.query.qName);
-        }
-        else {
-            request.query.qName = getInAddr6Arpa(request.query.qName);
+    for (QuerySection& query : request.queries) {
+        if (qType == PTR) {
+            if (query.qName.find(".") < string::npos) {
+                query.qName = getInAddrArpa(query.qName);
+            }
+            else {
+                query.qName = getInAddr6Arpa(query.qName);
+            }
         }
     }
+    
     if (verbose) {
         print(request);
     }
-    request = request.hton();
-    string payload = request.query.qName;
-    u_int offset = 0;
-    memcpy(requestBuffer, &request.header, sizeof(DnsHeader));
-    offset += sizeof(request.header);
-    memcpy(requestBuffer + offset, payload.data(), payload.size());
-    offset += payload.size();
-    memcpy(requestBuffer + offset, &request.query.qType, sizeof(u_short));
-    offset += sizeof(u_short);
-    memcpy(requestBuffer + offset, &request.query.qClass, sizeof(u_short));
-    offset += sizeof(u_short);
-    sendto(client, requestBuffer, offset, 0, (sockaddr*)&serverAddress, serverAddressSize);
+    
+    DnsResponse response = requestName(request, client, &serverAddress);
 
-    DnsResponse response;
-    char responseBuffer[10 * 1024];
-    int bytesReceived = recvfrom(client, responseBuffer, 1024, 0, (sockaddr*)&serverAddress, &serverAddressSize);
-    offset = 0;
-    memcpy(&response.header, responseBuffer, sizeof(DnsHeader));
-    offset += sizeof(DnsHeader);
-    response.query.qName = parseName(responseBuffer, offset);
-    memcpy(&response.query.qType, responseBuffer + offset, sizeof(u_short));
-    offset += sizeof(u_short);
-    memcpy(&response.query.qClass, responseBuffer + offset, sizeof(u_short));
-    offset += sizeof(u_short);
-    response.answer.name = parseName(responseBuffer, offset);
-    memcpy(&response.answer.type, responseBuffer + offset, sizeof(u_short));
-    offset += sizeof(u_short);
-    memcpy(&response.answer.klass, responseBuffer + offset, sizeof(u_short));
-    offset += sizeof(u_short);
-    memcpy(&response.answer.ttl, responseBuffer + offset, sizeof(u_int));
-    offset += sizeof(u_int);
-    memcpy(&response.answer.rdLength, responseBuffer + offset, sizeof(u_short));
-    offset += sizeof(u_short);
-    response = response.ntoh();
-    response.answer.rData = parsePayload(responseBuffer, (QType) response.query.qType, offset, response.answer.rdLength);
-    offset += response.answer.rData.size();
     if (verbose) {
         print(response);
     } else {
-        cout << response.answer.rData << endl;
+        for (const AnswerSection& answer : response.answers) {
+            cout << answer.rData << endl;
+        }
     }
+
     close(client);
     return 0;
 }
