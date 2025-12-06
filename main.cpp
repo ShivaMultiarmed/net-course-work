@@ -16,6 +16,30 @@ using namespace std;
 
 static const u_int BUFFER_SIZE = 1024;
 
+#pragma pack(push, 1)
+struct IpHeader {
+    u_char versionAndIhl, tos;
+    u_short length, id, flagsAndOffset;
+    u_char ttl, protocol;
+    u_short checkSum;
+    u_int source, destination;
+    IpHeader hton() {
+        return { versionAndIhl, tos, htons(length), htons(id), 
+            htons(flagsAndOffset), ttl, protocol, checkSum, 
+            htonl(source), htonl(destination) };
+    }
+}; 
+#pragma pack(pop)
+
+#pragma pack(push, 1)
+struct UdpHeader {
+    u_short source, destination, length, checkSum;
+    UdpHeader hton() {
+        return {htons(source), htons(destination), htons(length), checkSum};
+    }
+};
+#pragma pack(pop)
+
 string encodeName(string name) {
     vector<string> subStrings;
     while(!name.empty()) {
@@ -83,6 +107,13 @@ struct DnsRequest {
         transform(queries.begin(), queries.end(), networkOrderQuries.begin(), [](QuerySection& query){return query.hton();});
         return DnsRequest(header.hton(), networkOrderQuries);
     }
+    u_short size() const {
+        u_short s = sizeof(header);
+        for (const QuerySection& query : queries) {
+            s += query.qName.size() + 2 * sizeof(u_short);
+        }
+        return s;
+    }
 };
 
 struct AnswerSection {
@@ -111,6 +142,78 @@ struct DnsResponse {
     }
 };
 
+void addMod16(u_long& a, u_long b = 0) {
+    a += b;
+    while(a >> 16) {
+        a = (a >> 16) + (a & 0xFFFF);
+    }
+}
+
+u_short evaluateUdpCheckSum(
+    const u_int srcIp, 
+    const u_int dstIp,
+    const UdpHeader& udp,
+    const DnsRequest& request
+) {
+    u_long result = 0;
+    addMod16(result, srcIp >> 16);
+    addMod16(result, srcIp & 0xFFFF);
+    addMod16(result, dstIp >> 16);
+    addMod16(result, dstIp & 0xFFFF);
+    addMod16(result, 0x0011);
+    addMod16(result, sizeof(UdpHeader) + (u_short) request.size());
+    u_short* udpFields = (u_short*) &udp;
+    for (u_int i = 0; i < 4; i++) {
+        addMod16(result, udpFields[i]);
+    }
+    u_short* dnsHeaderFields = (u_short*) &request.header;
+    for (u_int i = 0; i < 4; i++) {
+        addMod16(result, dnsHeaderFields[i]);
+    }
+    char tempBuffer[1024] = {0};
+    u_int offset = 0;
+    for (const QuerySection& query : request.queries) {
+        memcpy(tempBuffer + offset, query.qName.data(), query.qName.size());
+        offset += query.qName.size();
+        memcpy(tempBuffer + offset, &query.qType, sizeof(u_short));
+        offset += sizeof(u_short);
+        memcpy(tempBuffer + offset, &query.qClass, sizeof(u_short));
+        offset += sizeof(u_short);
+    }
+    u_short* words = (u_short*) tempBuffer;
+    for (u_int i = 0; i < offset / 2; i++) {
+        addMod16(result, words[i]);
+    }
+    if (request.size() % 2 != 0) {
+        addMod16(result, tempBuffer[offset - 1] << 8);
+    }
+    cout << result << endl;
+    cout << (u_short) result << endl;
+    cout << (u_short)~((u_short) result) << endl;
+    return ~((u_short)result); 
+}
+
+/*u_short evaluateIpv4CheckSum(const IpHeader& ip) {
+    u_long result = 0;
+    u_short * header = (u_short *) &ip;
+    for (u_char i = 0; i < 10; i++) {
+        result += header[i];
+    }
+    while (result >> 16) {
+        result = result >> 16 + result & 0xFFFF;
+    }
+    return (u_long)~result;
+}*/
+
+u_short evaluateIpv4CheckSum(const IpHeader& ip) {
+    u_long result = 0;
+    u_short * header = (u_short *) &ip;
+    for (u_char i = 0; i < 10; i++) {
+        addMod16(result, header[i]);
+    }
+    return ~result;
+}
+
 string parseName(
     const char* responseBuffer, 
     u_int& offset, 
@@ -120,8 +223,7 @@ string parseName(
     bool first = true;
     while (true) {
         u_char len = responseBuffer[offset++];
-        if (len == 0) 
-        {
+        if (len == 0) {
             break;
         }
 
@@ -275,20 +377,37 @@ auto parseFlags(const u_short flags) {
 DnsResponse requestData(
     DnsRequest& request,
     const int client,
+    const string sourceIp,
+    const string destinationIp,
     const sockaddr_in* serverAddress
 ) {
-    request = request.hton();
-
     char requestBuffer[BUFFER_SIZE];
-
     u_int offset = 0;
-    memcpy(requestBuffer, &request.header, sizeof(DnsHeader));
-    offset += sizeof(request.header);
 
+    in_addr srcIp, dstIp;
+    inet_aton(sourceIp.c_str(), &srcIp);
+    inet_aton(destinationIp.c_str(), &dstIp);
+
+    DnsRequest requestCopy = request.hton();
+
+    IpHeader ip = {(4 << 4) | (sizeof(IpHeader) / 4), 0x00, requestCopy.size() + sizeof(UdpHeader) + sizeof(IpHeader), 1, 0, 128, 17, 0, ntohl(srcIp.s_addr), ntohl(dstIp.s_addr)};
+    ip = ip.hton();
+    ip.checkSum = evaluateIpv4CheckSum(ip);
+    memcpy(requestBuffer, &ip, sizeof(IpHeader));
+    offset += sizeof(IpHeader);
+    
+    UdpHeader udp = {5000, 53, sizeof(UdpHeader) + requestCopy.size(), 0};
+    // udp.checkSum = evaluateUdpCheckSum(ntohl(srcIp.s_addr), ntohl(dstIp.s_addr), udp, request);
+    udp = udp.hton();
+    memcpy(requestBuffer + offset, &udp, sizeof(UdpHeader));
+    offset += sizeof(UdpHeader);
+
+    request = request.hton();
+    memcpy(requestBuffer + offset, &request.header, sizeof(DnsHeader));
+    offset += sizeof(request.header);
     for (const QuerySection& query : request.queries) {
-        string payload = query.qName;
-        memcpy(requestBuffer + offset, payload.data(), payload.size());
-        offset += payload.size();
+        memcpy(requestBuffer + offset, query.qName.data(), query.qName.size());
+        offset += query.qName.size();
         memcpy(requestBuffer + offset, &query.qType, sizeof(u_short));
         offset += sizeof(u_short);
         memcpy(requestBuffer + offset, &query.qClass, sizeof(u_short));
@@ -303,10 +422,22 @@ DnsResponse requestData(
     char responseBuffer[BUFFER_SIZE];
 
     int bytesReceived = recvfrom(client, responseBuffer, BUFFER_SIZE, 0, (sockaddr*)serverAddress, &serverAddressSize);
-    offset = 0;
+    
+    u_int ipHeaderLength = (((u_char *)responseBuffer)[0] & 0x0F) * 4;
+    cout << ipHeaderLength << endl;
+    offset = ipHeaderLength + sizeof(UdpHeader);
 
-    memcpy(&response.header, responseBuffer, sizeof(DnsHeader));
+    memcpy(&response.header, responseBuffer + offset, sizeof(DnsHeader));
     offset += sizeof(DnsHeader);
+
+    cout << bytesReceived << endl;
+    cout << responseBuffer << endl;
+
+    auto h = response.header.ntoh();
+    cout << h.qdCount << endl;
+    cout << h.anCount << endl;
+    cout << h.nsCount << endl;
+    cout << h.arCount << endl;
 
     response.queries = vector<QuerySection>(ntohs(response.header.qdCount));
 
@@ -467,11 +598,17 @@ int main (int argc, char** argv) {
             printUsage(argv[0]);
             return -1;
         }
-    } catch (exception e) {
+    } catch (exception& e) {
         printUsage(argv[0]);
         return -1;
     }
-    int client = socket(AF_INET, SOCK_DGRAM,0);
+    int client = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if (client == -1) {
+        perror("socket");
+        return -2;
+    }
+    int one = 1;
+    setsockopt(client, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
     sockaddr_in serverAddress {AF_INET, htons(port)};
     inet_aton(serverHost.c_str(), &serverAddress.sin_addr);
     u_int serverAddressSize = sizeof(sockaddr_in);
@@ -493,7 +630,7 @@ int main (int argc, char** argv) {
         print(request);
     }
     
-    DnsResponse response = requestData(request, client, &serverAddress);
+    DnsResponse response = requestData(request, client, "192.168.1.11", serverHost, &serverAddress);
 
     if (verbose) {
         print(response);
